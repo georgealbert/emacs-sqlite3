@@ -28,10 +28,11 @@
 int plugin_is_GPL_compatible;
 
 struct el_sql_resultset {
-	sqlite3 *db;
+	sqlite3      *db;
 	sqlite3_stmt *stmt;
-	emacs_value fields;
-	bool eof;
+	bool          is_finalize_stmt;
+	emacs_value   fields;
+	bool          eof;
 };
 
 static char*
@@ -60,7 +61,11 @@ static void
 el_sqlite3_resultset_free(void *arg)
 {
 	struct el_sql_resultset *rs = (struct el_sql_resultset*)arg;
-	sqlite3_finalize(rs->stmt);
+
+	if (rs->is_finalize_stmt) {
+	    sqlite3_finalize(rs->stmt);
+	}
+
 	free(rs);
 }
 
@@ -135,6 +140,42 @@ bind_values(emacs_env *env, sqlite3 *db, sqlite3_stmt *stmt, emacs_value bounds)
 	}
 
 	return NULL;
+}
+
+static void
+el_sqlite3_free_stmt(void *arg)
+{
+	sqlite3_finalize((sqlite3_stmt*)arg);
+}
+
+/* param: sdb
+          sql */
+static emacs_value
+Fsqlite3_prepare(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data)
+{
+	int           ret = 0;
+	ptrdiff_t     size = 0;
+	char         *query = retrieve_string(env, args[1], &size);
+	sqlite3      *sdb = env->get_user_ptr(env, args[0]);
+	emacs_value   Qnil = env->intern(env, "nil");
+	emacs_value   retval = Qnil;
+	sqlite3_stmt *stmt = NULL;
+
+	ret = sqlite3_prepare_v2(sdb, query, size, &stmt, NULL);
+	if (ret != SQLITE_OK) {
+		if (stmt) {
+			sqlite3_finalize(stmt);
+		}
+
+		goto exit;
+	}
+
+	/* NULL for test, no finalizer for prepared statement. */
+	retval = env->make_user_ptr(env, el_sqlite3_free_stmt, stmt);
+
+exit:
+	free(query);
+	return retval;
 }
 
 static emacs_value
@@ -300,6 +341,7 @@ Fsqlite3_execute(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data
 
 		result->db = sdb;
 		result->stmt = stmt;
+		result->is_finalize_stmt = true;
 		result->fields = fields;
 		result->eof = false;
 		retval = env->make_user_ptr(env, el_sqlite3_resultset_free, result);
@@ -318,6 +360,78 @@ Fsqlite3_execute(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data
  exit:
 	free(query);
 
+	if (errmsg != NULL) {
+		emacs_value errstr = env->make_string(env, errmsg, strlen(errmsg));
+		env->non_local_exit_signal(env, env->intern(env, "error"), errstr);
+	}
+
+	return retval;
+}
+
+/* execute sql using prepare statement.
+   can be invoked with binding values.*/
+static emacs_value
+Fsqlite3_execute_with_stmt(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data)
+{
+	int           ret    = 0;
+	sqlite3      *sdb    = env->get_user_ptr(env, args[0]);
+	const char   *errmsg = NULL;
+	emacs_value   Qnil   = env->intern(env, "nil");
+	emacs_value   retval = Qnil;
+	sqlite3_stmt *stmt   = env->get_user_ptr(env, args[1]);
+
+	sqlite3_reset(stmt);
+
+	if (env->is_not_nil(env, args[2])) {
+		const char *err = bind_values(env, sdb, stmt, args[2]);
+		if (err != NULL) {
+			errmsg = err;
+			goto exit;
+		}
+	}
+
+	/* emacs_value Qcons = env->intern(env, "cons"); */
+	/* emacs_value fields = Qnil; */
+	/* int count = sqlite3_column_count(stmt); */
+	/* for (int i = 0; i < count; ++i) { */
+	/* 	const char *name = sqlite3_column_name(stmt, i); */
+	/* 	emacs_value cargs[] = { */
+	/* 		env->make_string(env, name, strlen(name)), */
+	/* 		fields, */
+	/* 	}; */
+	/* 	fields = env->funcall(env, Qcons, 2, cargs); */
+	/* } */
+
+	/* emacs_value Qreverse = env->intern(env, "reverse"); */
+	/* emacs_value rargs[] = {fields}; */
+	/* fields = env->funcall(env, Qreverse, 1, rargs); */
+
+	emacs_value cb = args[3];
+	if (!env->is_not_nil(env, cb)) {
+		struct el_sql_resultset *result = malloc(sizeof(struct el_sql_resultset));
+
+		/* 这里要修改一下,不能直接 finalize 掉 我们调用 prepare 生成的stmt */
+		result->db = sdb;
+		result->stmt = stmt;
+		result->is_finalize_stmt = false;
+		result->fields = NULL;
+		result->eof = false;
+		retval = env->make_user_ptr(env, el_sqlite3_resultset_free, result);
+		goto exit;
+	}
+
+	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
+		/* emacs_value cb_args[2]; */
+		emacs_value cb_args[1];
+		cb_args[0] = row_to_value(env, stmt);
+		/* cb_args[1] = fields; */
+		env->funcall(env, cb, 1, cb_args);
+		/* env->funcall(env, cb, 2, cb_args); */
+	}
+
+	/* sqlite3_finalize(stmt); */
+
+ exit:
 	if (errmsg != NULL) {
 		emacs_value errstr = env->make_string(env, errmsg, strlen(errmsg));
 		env->non_local_exit_signal(env, env->intern(env, "error"), errstr);
@@ -430,6 +544,8 @@ emacs_module_init(struct emacs_runtime *ert)
 	DEFUN("sqlite3-transaction", Fsqlite3_transaction, 1, 1, NULL, NULL);
 	DEFUN("sqlite3-commit", Fsqlite3_commit, 1, 1, NULL, NULL);
 	DEFUN("sqlite3-rollback", Fsqlite3_rollback, 1, 1, NULL, NULL);
+	DEFUN("sqlite3-prepare", Fsqlite3_prepare, 2, 2, NULL, NULL);
+	DEFUN("sqlite3-execute-with-stmt", Fsqlite3_execute_with_stmt, 4, 4, NULL, NULL);
 
 	// resultset API
 	DEFUN("sqlite3-resultset-next", Fsqlite3_resultset_next, 1, 1, NULL, NULL);
